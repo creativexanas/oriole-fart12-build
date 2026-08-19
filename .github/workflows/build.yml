@@ -21,29 +21,36 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Run 32308443429 (281592b) DIED HERE-adjacent: the 16GB swap dd +
+          # image drift left too little room and `repo sync` filled the root
+          # FS -> the runner worker itself crashed with ENOSPC (couldn't even
+          # write its own _diag log; job logs lost, BlobNotFound). Expand the
+          # reclaim and fail fast with readable logs instead of dying mid-sync.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost /usr/share/swift \
+                      /opt/hostedtoolcache
+          sudo docker image prune -a -f 2>/dev/null || true
+          sudo docker system prune -a --volumes -f 2>/dev/null || true
           sudo apt-get clean
-          df -h
+          df -h /
+          FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "free after cleanup: ${FREE_GB}G (need >=80G for the all,-notdefault shallow sync)"
+          if [ "${FREE_GB}" -lt 80 ]; then
+            echo "ERROR: less than 80G free after cleanup; aborting before repo sync fills the disk" >&2
+            exit 1
+          fi
 
-      - name: Create swap (16GB, unconditional)
+      - name: Reclaim stock swapfile (sync needs no swap)
         run: |
-          # IMPORTANT: recreate the swapfile unconditionally. The 2025+ runner
-          # images ship a pre-existing ~3GB /swapfile; the old "if [ ! -f
-          # /swapfile ]" guard silently kept that 3GB file and skipped the dd,
-          # which is exactly why the redfin Bug 36 "8GB swap" fix never took
-          # effect (swapon --show still reported 3G). Root FS has ~105GB free,
-          # so a 16GB swapfile is cheap and gives soong_build analysis +
-          # ninja headroom on the 15GB-RAM box.
+          # repo sync peaks at ~2-4GB RSS on a 15GB-RAM box — no swap needed
+          # in the SYNC job. The stock image's ~3GB /swapfile is dead disk
+          # weight here (run 32308443429's 16GB swapfile is what ate the
+          # sync headroom). Swap stays 16GB-unconditional in the BUILD job,
+          # where soong's ~10GB single-process analysis actually needs it.
           sudo swapoff -a 2>/dev/null || true
           sudo rm -f /swapfile
-          # fallocate can create a sparse file whose real block usage is far
-          # below the requested size; dd guarantees the full allocation.
-          sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=none
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          sudo swapon --show
           free -h
+          df -h /
 
       - name: Install repo tool
         run: |
@@ -83,6 +90,7 @@ jobs:
           # clone manifest from ANDROID 12+ that allows lazy checkout.
           repo sync -c -j4 --no-tags --no-clone-bundle --use-superproject --retry-fetches=3
           echo "aosp synced: $(du -sh .repo | cut -f1) of manifest metadata"
+          df -h /
           # Oriole sanity: device tree present at this tag?
           ls device/google/raviole/aosp_oriole.mk
           ls device/google/gs101/AndroidProducts.mk 2>/dev/null || ls device/google/gs101/ | head -5
@@ -97,9 +105,22 @@ jobs:
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          # Same expanded reclaim as the sync job (run 32308443429 root cause:
+          # ENOSPC killed the runner). The build job needs even more room:
+          # 16G swap + ~70G synced tree + out/ (30-50G) + 5G ccache.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost /usr/share/swift \
+                      /opt/hostedtoolcache
+          sudo docker image prune -a -f 2>/dev/null || true
+          sudo docker system prune -a --volumes -f 2>/dev/null || true
           sudo apt-get clean
-          df -h
+          df -h /
+          FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "free after cleanup: ${FREE_GB}G (need >=95G: swap 16G + tree ~70G + out/ + ccache 5G)"
+          if [ "${FREE_GB}" -lt 95 ]; then
+            echo "ERROR: less than 95G free after cleanup; the build would ENOSPC mid-compile" >&2
+            exit 1
+          fi
 
       - name: Create swap (16GB, unconditional)
         run: |
@@ -161,6 +182,7 @@ jobs:
           git config --global http.lowSpeedTime 600
           repo sync -c -j4 --no-tags --no-clone-bundle --use-superproject --retry-fetches=3
           ls device/google/raviole/aosp_oriole.mk
+          df -h /
 
       - name: Restore ccache + soong bootstrap
         uses: actions/cache@v4
@@ -234,6 +256,7 @@ jobs:
           # + soong bootstrap caches carry run 2 to completion.
           m -j$(($(nproc) / 2)) systemimage 2>&1 | tee build.log
           echo "build exit: ${PIPESTATUS[0]}"
+          df -h /
           SYS_SIZE=$(stat -c%s out/target/product/oriole/system.img 2>/dev/null || stat -f%z out/target/product/oriole/system.img)
           echo "system.img size: ${SYS_SIZE} bytes"
           # Sanity-check: aosp_oriole system.img should be in the same ballpark as
