@@ -1,4 +1,4 @@
-name: build-redfin-fart
+name: build-oriole-fart
 
 on:
   workflow_dispatch:
@@ -25,20 +25,23 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Create swap (8GB)
+      - name: Create swap (16GB, unconditional)
         run: |
-          if ! sudo swapon --show | grep -q '/swapfile'; then
-            if [ ! -f /swapfile ]; then
-              # fallocate sometimes creates a sparse file whose actual block usage
-              # is far less than the requested size; mkswap then reports the
-              # smaller size. Use dd with a real block device for a guaranteed
-              # 8GB file.
-              sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
-              sudo chmod 600 /swapfile
-              sudo mkswap /swapfile
-            fi
-            sudo swapon /swapfile
-          fi
+          # IMPORTANT: recreate the swapfile unconditionally. The 2025+ runner
+          # images ship a pre-existing ~3GB /swapfile; the old "if [ ! -f
+          # /swapfile ]" guard silently kept that 3GB file and skipped the dd,
+          # which is exactly why the redfin Bug 36 "8GB swap" fix never took
+          # effect (swapon --show still reported 3G). Root FS has ~105GB free,
+          # so a 16GB swapfile is cheap and gives soong_build analysis +
+          # ninja headroom on the 15GB-RAM box.
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile
+          # fallocate can create a sparse file whose real block usage is far
+          # below the requested size; dd guarantees the full allocation.
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=none
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
           sudo swapon --show
           free -h
 
@@ -60,6 +63,9 @@ jobs:
         run: |
           mkdir -p aosp
           cd aosp
+          # -g all,-notdefault pulls in the device trees. For oriole the device
+          # tree is device/google/raviole (+ device/google/gs101, gs101-sepolicy,
+          # gs-common, raviole-kernel), all present at android-12.1.0_r2.
           repo init -u https://android.googlesource.com/platform/manifest -b "${AOSP_TAG:-android-12.1.0_r2}" --depth=1 -g all,-notdefault
 
       - name: Repo sync
@@ -77,9 +83,12 @@ jobs:
           # clone manifest from ANDROID 12+ that allows lazy checkout.
           repo sync -c -j4 --no-tags --no-clone-bundle --use-superproject --retry-fetches=3
           echo "aosp synced: $(du -sh .repo | cut -f1) of manifest metadata"
+          # Oriole sanity: device tree present at this tag?
+          ls device/google/raviole/aosp_oriole.mk
+          ls device/google/gs101/AndroidProducts.mk 2>/dev/null || ls device/google/gs101/ | head -5
 
   build:
-    name: "2/3 - build boot.img (boot + ART only)"
+    name: "2/3 - build system.img (FART userland)"
     needs: sync
     runs-on: ubuntu-22.04
     timeout-minutes: 480
@@ -92,20 +101,19 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Create swap (8GB)
+      - name: Create swap (16GB, unconditional)
         run: |
-          if ! sudo swapon --show | grep -q '/swapfile'; then
-            if [ ! -f /swapfile ]; then
-              # fallocate sometimes creates a sparse file whose actual block usage
-              # is far less than the requested size; mkswap then reports the
-              # smaller size. Use dd with a real block device for a guaranteed
-              # 8GB file.
-              sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
-              sudo chmod 600 /swapfile
-              sudo mkswap /swapfile
-            fi
-            sudo swapon /swapfile
-          fi
+          # See sync job note: the runner image ships a ~3GB /swapfile that the
+          # old existence-guard kept in place. Recreate unconditionally so the
+          # soong analysis phase (~10GB single-process RSS) survives on the
+          # 15GB-RAM runner. This was the root cause of the redfin exit-143
+          # OOM kills at "99% soong bootstrap -> 4min later dead".
+          sudo swapoff -a 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=none
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
           sudo swapon --show
           free -h
 
@@ -145,7 +153,14 @@ jobs:
           mkdir -p aosp
           cd aosp
           repo init -u https://android.googlesource.com/platform/manifest -b "${AOSP_TAG:-android-12.1.0_r2}" --depth=1 -g all,-notdefault
-          repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+          # Same googlesource hardening as the sync job (the build job sync was
+          # previously unhardened and could hang on a throttled fetch).
+          git config --global http.postBuffer 524288000
+          git config --global core.compression 0
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 600
+          repo sync -c -j4 --no-tags --no-clone-bundle --use-superproject --retry-fetches=3
+          ls device/google/raviole/aosp_oriole.mk
 
       - name: Restore ccache + soong bootstrap
         uses: actions/cache@v4
@@ -154,12 +169,14 @@ jobs:
             ~/.ccache
             aosp/out/soong/.bootstrap
           # Primary key tied to the SHA: when the same commit builds twice it
-          # restores. Restore-keys provide a graceful fallback across commits
-          # (the old dc67e88 cache is 220MB of soong bootstrap + ccache that
-          # the next run can re-use even after a new commit).
-          key: build-redfin-${{ github.sha }}
+          # restores. Restore-keys provide a graceful fallback across commits.
+          # NOTE: a cold `m systemimage` at -j2 on the 4-core runner can exceed
+          # the 6h platform job cap; if run 1 is killed mid-build, re-run the
+          # workflow — ccache (C/C++) + the soong bootstrap cache let run 2
+          # finish within budget.
+          key: build-oriole-${{ github.sha }}
           restore-keys: |
-            build-redfin-
+            build-oriole-
 
       - name: Copy fart12-lite files into AOSP tree
         run: |
@@ -187,46 +204,41 @@ jobs:
         run: |
           cd aosp
           source build/envsetup.sh
-          lunch aosp_redfin-userdebug
+          lunch aosp_oriole-userdebug
           echo "lunch complete: TARGET_PRODUCT=${TARGET_PRODUCT} TARGET_BUILD_VARIANT=${TARGET_BUILD_VARIANT}"
 
       - name: Build system.img (FART-modified ART + framework + libcore)
         run: |
           cd aosp
           source build/envsetup.sh
-          lunch aosp_redfin-userdebug
+          lunch aosp_oriole-userdebug
           set -o pipefail
           # fart12-lite modifies ONLY userland: libart.so, framework.jar, services.jar,
-          # boot.art, and DexFile.java. These all live under system.img on Android 12+.
-          # The kernel (vendor_boot.img + boot.img stub) is unmodified — we ship the
-          # factory kernel from the official redfin factory image instead of rebuilding
-          # it (Pixel 5 kernel source is NOT public on android.googlesource.com; only
-          # prebuilt .ko modules are under device/google/redbull-kernel).
+          # boot.art, and DexFile.java. These all live under system.img on Android 12+
+          # (libart + libcore jars inside the com.android.art APEX, framework.jar in
+          # /system/framework). The kernel (vendor_boot.img + boot.img) is unmodified —
+          # we ship the factory kernel from the official oriole factory image instead of
+          # rebuilding it (Pixel 6 kernel source for the launch bootloader era is not in
+          # the public AOSP tree; device/google/raviole-kernel ships prebuilt
+          # kernel/modules which we do not rebuild).
           #
-          # Memory budget on the GitHub-hosted ubuntu-22.04 runner is ~15.6GB RAM
-          # + 8GB swap. AOSP soong-bootstrap warns "minimum required amount of
-          # free memory is around 16GB" at the start of every build, and ART/CC
-          # parallel compiles easily OOM-kill the runner (exit 143 = SIGTERM
-          # from the runner watchdog, NOT a clang error) within minutes of
-          # hitting the first big ninja edge. Mitigation:
-          #   -j$(($(nproc) / 2))     → cap concurrency at half the cores
-          #                              (2 jobs on the 4-core hosted runner).
-          #                              Peak per-job RSS halves → much less
-          #                              page-cache pressure on the 15.6GB box.
-          #   NINJA_STATUS / -k 0     → let ninja serialize gracefully instead of
-          #                              spawning 4 wide-link processes at once.
-          #   ANDROID_JAVA_HOME heap  → already set by envsetup, no change.
+          # Memory budget: 15GB RAM + 16GB swap (see swap step). soong_build
+          # analysis of the full tree peaks ~10GB single-process; ninja edges
+          # (host dex2oat for boot.art, ART APEX compile) each take 3-4GB.
+          # -j$(($(nproc) / 2)) caps concurrency at 2 on the 4-core runner so
+          # peak RSS fits RAM+swap without the runner watchdog SIGTERMing us
+          # (that exit-143 is a memory kill, NOT a clang error).
           #
-          # Build takes ~30-60min on a 4-core hosted runner with ccache; with
-          # the -j cap expect 60-90min. Acceptable tradeoff vs OOM-rebooting
-          # every run.
+          # Cold build estimate: 5-8h at -j2. GitHub-hosted jobs are hard-capped
+          # at 6h; if this run is killed near the end, re-dispatch — the ccache
+          # + soong bootstrap caches carry run 2 to completion.
           m -j$(($(nproc) / 2)) systemimage 2>&1 | tee build.log
           echo "build exit: ${PIPESTATUS[0]}"
-          SYS_SIZE=$(stat -c%s out/target/product/redfin/system.img 2>/dev/null || stat -f%z out/target/product/redfin/system.img)
+          SYS_SIZE=$(stat -c%s out/target/product/oriole/system.img 2>/dev/null || stat -f%z out/target/product/oriole/system.img)
           echo "system.img size: ${SYS_SIZE} bytes"
-          # Sanity-check: aosp_redfin system.img should be > 500MB (843MB factory).
-          # AOSP-only build is smaller because it omits GMS/Verizon blobs, but still
-          # > 200MB. If it's tiny, the build didn't link any modules in.
+          # Sanity-check: aosp_oriole system.img should be in the same ballpark as
+          # redfin's AOSP build (>200MB; factory is ~1.6GB but AOSP omits GMS).
+          # If it's tiny, the build didn't link any modules in.
           if [ "${SYS_SIZE}" -lt 200000000 ]; then
             echo "ERROR: system.img suspiciously small (${SYS_SIZE}B); userland build likely failed" >&2
             exit 1
@@ -239,14 +251,14 @@ jobs:
           path: |
             ~/.ccache
             aosp/out/soong/.bootstrap
-          key: build-redfin-${{ github.sha }}
+          key: build-oriole-${{ github.sha }}
 
       - name: Upload system image (FART-modified)
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: system-image
-          path: aosp/out/target/product/redfin/system.img
+          path: aosp/out/target/product/oriole/system.img
           if-no-files-found: error
           retention-days: 7
 
@@ -260,7 +272,7 @@ jobs:
           retention-days: 30
 
   assemble:
-    name: "3/3 - assemble flashable bundle (factory + custom boot)"
+    name: "3/3 - assemble flashable bundle (factory + custom system)"
     needs: build
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -277,16 +289,20 @@ jobs:
       - name: Install unzip
         run: sudo apt-get install -y unzip
 
-      - name: Download redfin factory image
+      - name: Download oriole factory image
         run: |
           set -e
-          FACTORY_URL="https://dl.google.com/dl/android/aosp/redfin-sq1a.220205.002-factory-734556ab.zip"
+          # android-12.1.0_r2 == SP2A.220305.013.A3, and per the AOSP
+          # build-numbers page this tag's supported devices are EXACTLY
+          # Pixel 6 (oriole) + Pixel 6 Pro (raven) — so the factory build
+          # matches the AOSP source tag precisely.
+          FACTORY_URL="https://dl.google.com/dl/android/aosp/oriole-sp2a.220305.013.a3-factory-8bea92d1.zip"
           curl -L --fail -o factory.zip "${FACTORY_URL}"
           ls -lh factory.zip
           unzip -q factory.zip -d factory
           ls factory/
           # Inner zip layout: factory/<codename>-<buildid>/image-<codename>-<buildid>-<suffix>.zip
-          INNER_ZIP=$(find factory -maxdepth 3 -name 'image-redfin-*.zip' -print -quit)
+          INNER_ZIP=$(find factory -maxdepth 3 -name 'image-oriole-*.zip' -print -quit)
           echo "INNER_ZIP=${INNER_ZIP}"
           if [ -z "${INNER_ZIP}" ]; then
             echo "ERROR: inner factory zip not found" >&2
@@ -296,15 +312,19 @@ jobs:
           mkdir -p factory/extracted
           unzip -q "${INNER_ZIP}" -d factory/extracted
           ls -la factory/extracted/
-          # Keep FACTORY system.img/vendor_boot.img/boot.img/dtbo intact.
-          # FART only modifies userland under system.img; kernel + bootloader +
-          # modem + dtbo come from factory as-is.
+          # Keep FACTORY images intact. FART only modifies userland under
+          # system.img; kernel + bootloader + modem + dtbo + vendor + product
+          # all come from the matching factory build as-is.
           cp factory/extracted/boot.img .
           cp factory/extracted/vendor_boot.img .
           cp factory/extracted/vendor.img .
+          cp factory/extracted/product.img .
+          cp factory/extracted/system_ext.img .
           cp factory/extracted/dtbo.img .
-          cp factory/extracted/bootloader-redfin-*.img .
-          cp factory/extracted/radio-redfin-*.img 2>/dev/null || echo "no radio img (OK for redfin)"
+          cp factory/extracted/bootloader-oriole-*.img .
+          # oriole (Pixel 6, Tensor Exynos modem) ALWAYS ships a radio image
+          # (radio-oriole-g5123b-*.img in this build).
+          cp factory/extracted/radio-oriole-*.img .
           cp factory/extracted/vbmeta.img .
           ls *.img
 
@@ -313,14 +333,19 @@ jobs:
           mkdir -p bundle
           # Custom: FART-modified system.img contains libart.so + framework.jar + boot.art
           #         with cn.zskkk.FFaarrtt framework class and DexFile hooks.
-          cp images/system.img bundle/system-aosp-fart.img
           # Factory: kernel lives in vendor_boot.img on Android 12+; boot.img is a stub.
+          #          product.img + system_ext.img are flashed too: coming from an
+          #          Android 15 daily driver, leaving A15 product/system_ext on the
+          #          device while flashing an A12 system would guarantee breakage.
+          cp images/system.img bundle/system-aosp-fart.img
           cp boot.img bundle/
           cp vendor_boot.img bundle/
           cp vendor.img bundle/
+          cp product.img bundle/
+          cp system_ext.img bundle/
           cp dtbo.img bundle/
-          cp bootloader-redfin-*.img bundle/
-          cp radio-redfin-*.img bundle/ 2>/dev/null || true
+          cp bootloader-oriole-*.img bundle/
+          cp radio-oriole-*.img bundle/
           cp vbmeta.img bundle/
           cp f1rt.config bundle/
 
@@ -345,39 +370,40 @@ jobs:
         run: |
           cp build.log bundle/build.log 2>/dev/null || echo "no build log captured"
           cd bundle
-          zip -r ../redfin-fart-${GITHUB_SHA::7}.zip .
+          zip -r ../oriole-fart-${GITHUB_SHA::7}.zip .
           cd ..
-          ls -lh redfin-fart-*.zip
+          ls -lh oriole-fart-*.zip
 
       - name: Upload final bundle
         uses: actions/upload-artifact@v4
         with:
-          name: redfin-fart-bundle
-          path: redfin-fart-${GITHUB_SHA::7}.zip
+          name: oriole-fart-bundle
+          path: oriole-fart-${GITHUB_SHA::7}.zip
           if-no-files-found: error
           retention-days: 30
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: redfin-fart-${{ github.sha }}
-          name: "Redfin FART12 build ${{ github.sha }}"
+          tag_name: oriole-fart-${{ github.sha }}
+          name: "Oriole FART12 build ${{ github.sha }}"
           body: |
-            AOSP 12.1.0_r2 userdebug system.img with fart12-lite patches for Pixel 5 (redfin).
+            AOSP 12.1.0_r2 (SP2A.220305.013.A3) userdebug system.img with fart12-lite patches for Pixel 6 (oriole).
 
             Bundle contents:
             - system-aosp-fart.img (CUSTOM — AOSP 12.1.0_r2 with FART12 ART/framework/libcore)
             - boot.img, vendor_boot.img (FACTORY — kernel shipped as-is)
-            - vendor.img, dtbo.img (FACTORY)
-            - bootloader-redfin-*.img, radio-redfin-*.img (FACTORY)
+            - vendor.img, product.img, system_ext.img, dtbo.img (FACTORY)
+            - bootloader-oriole-slider-*.img, radio-oriole-*.img (FACTORY)
             - vbmeta.img (FACTORY — flash with --disable-verity --disable-verification)
-            - flash-all.sh (auto-generated by this build)
+            - flash-all.sh (auto-generated by this build; includes fastboot -w downgrade wipe)
             - f1rt.config (FART runtime config — push to /data/local/tmp/)
 
-            Targets com.sacombankpay for DexProtector dump extraction.
+            Targets com.mustafahameed.mirmazacademy (owner's own app) for packed-DEX dump extraction.
+            WARNING: Pixel 6 took a bootloader anti-rollback in the May 2025 update — see flash-all.sh header before flashing a device currently on Android 15.
             Build SHA: ${{ github.sha }}
             Build date: ${{ env.BUILD_DATE }}
-          files: redfin-fart-${{ github.sha }}.zip
+          files: oriole-fart-${{ github.sha }}.zip
           draft: false
           prerelease: false
           fail_on_unmatched_files: true

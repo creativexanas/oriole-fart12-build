@@ -6,17 +6,39 @@ BUILD_TAG="__BUILD_TAG__"
 BUILD_DATE="__BUILD_DATE__"
 
 echo "=========================================="
-echo " Redfin FART12 build: ${BUILD_TAG}"
+echo " Oriole (Pixel 6) FART12 build: ${BUILD_TAG}"
 echo " Build date: ${BUILD_DATE}"
 echo "=========================================="
 echo ""
-echo "This script flashes a Pixel 5 (redfin) with:"
+echo "This script flashes a Pixel 6 (oriole) with:"
 echo "  - Factory stock kernel (boot.img + vendor_boot.img) — UNCHANGED"
-echo "  - Factory stock bootloader/radio/dtbo/vendor/vbmeta"
-echo "  - CUSTOM system.img containing AOSP 12.1.0_r2 userland with"
-echo "    fart12-lite patches (libart.so + framework.jar + boot.art + DexFile)"
+echo "  - Factory stock bootloader/radio/dtbo/vendor/product/system_ext/vbmeta"
+echo "  - CUSTOM system.img containing AOSP 12.1.0_r2 (SP2A.220305.013.A3)"
+echo "    userland with fart12-lite patches (libart.so + framework.jar +"
+echo "    boot.art + DexFile hooks)"
 echo ""
-echo "Targets com.sacombankpay for DexProtector dump extraction."
+echo "Targets com.mustafahameed.mirmazacademy (owner's own app) for"
+echo "packed-DEX dump extraction."
+echo ""
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+echo " READ BEFORE FLASHING — Android 15 -> Android 12 downgrade caveats:"
+echo ""
+echo " 1. ANTI-ROLLBACK: Google shipped a bootloader anti-rollback for"
+echo "    Pixel 6/6 Pro/6a in the May 2025 security update. If this device"
+echo "    has EVER booted a May-2025-or-newer bootloader (any Android 15"
+echo "    build from mid-2025 on), the bootloader will REFUSE to boot this"
+echo "    Android 12 build even with the bootloader unlocked. Check first:"
+echo "      fastboot getvar version-bootloader"
+echo "      fastboot getvar rollback-index   # if > 0 and this errors, stop"
+echo "    If flashing the bootloader below fails with an anti-rollback"
+echo "    error, DO NOT continue — restore stock instead (see README)."
+echo ""
+echo " 2. DATA WIPE: downgrading Android 15 -> 12 ALWAYS requires wiping"
+echo "    userdata (userdata/metadata encryption formats are incompatible)."
+echo "    This script runs 'fastboot -w' automatically. Back up first."
+echo ""
+echo " 3. Bootloader MUST be unlocked (it is on this research device)."
+echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
 echo ""
 
 if ! command -v fastboot >/dev/null 2>&1; then
@@ -29,53 +51,74 @@ if [ -z "${DEVICE}" ]; then
   echo "ERROR: no device in fastboot mode. Reboot to bootloader and retry." >&2
   exit 1
 fi
+echo "Device in fastboot: ${DEVICE}"
+fastboot getvar version-bootloader 2>/dev/null || true
 
-# Phase 1: bootloader-level partitions (vendor_boot, boot stub, dtbo)
-echo "[1/7] Flashing bootloader..."
-fastboot flash bootloader bootloader-redfin-*.img
+# Phase 1: bootloader first (downgrades MUST flash the matching old bootloader
+# before anything else — a new bootloader + old everything-else will not boot).
+echo "[1/8] Flashing bootloader (slider-1.1, Android 12L era)..."
+BOOTLOADER_IMG=$(ls bootloader-oriole-*.img | head -1)
+fastboot flash bootloader "${BOOTLOADER_IMG}"
 fastboot reboot-bootloader
-sleep 2
+sleep 5
 
-echo "[2/7] Flashing radio (modem)..."
-fastboot flash radio radio-redfin-*.img 2>/dev/null || echo "  (no radio — OK for redfin)"
+# Radio next (Exynos Tensor modem image from the same factory build).
+echo "[2/8] Flashing radio (modem)..."
+RADIO_IMG=$(ls radio-oriole-*.img | head -1)
+fastboot flash radio "${RADIO_IMG}"
+fastboot reboot-bootloader
+sleep 5
 
 # Disable AVB verification BEFORE flashing custom system.img, otherwise the
 # bootloader refuses to boot the (unsigned, FART-modified) userland.
-echo "[3/7] Disabling AVB (vbmeta --disable-verity --disable-verification)..."
+echo "[3/8] Disabling AVB (vbmeta --disable-verity --disable-verification)..."
 fastboot flash vbmeta --disable-verity --disable-verification vbmeta.img
 
-# Factory boot.img + vendor_boot.img: shipped unchanged. Pixel 5 kernel lives in
-# vendor_boot.img on Android 12+; boot.img is a small stub with the early-init
-# ramdisk. Re-flashing them is a no-op but doesn't hurt — keeps slots consistent.
-echo "[4/7] Flashing factory boot.img + vendor_boot.img + dtbo.img (unchanged)..."
+# Factory boot.img + vendor_boot.img: shipped unchanged. Pixel 6 kernel lives
+# in vendor_boot.img on Android 12; boot.img is a small stub with the
+# early-init ramdisk. Re-flashing keeps slots consistent.
+echo "[4/8] Flashing factory boot.img + vendor_boot.img + dtbo.img (unchanged)..."
 fastboot flash boot boot.img
 fastboot flash vendor_boot vendor_boot.img
 fastboot flash dtbo dtbo.img
 
-# Android 12+ uses dynamic partitions (super). system.img is a sparse image
-# under the super partition; flashing it requires fastbootd. Reboot first.
-echo "[5/7] Rebooting into fastbootd for dynamic partitions..."
+# Android 12 uses dynamic partitions (super). system/vendor/product/system_ext
+# are logical partitions under super; flashing them requires fastbootd.
+echo "[5/8] Rebooting into fastbootd for dynamic partitions..."
 fastboot reboot fastboot
-sleep 3
+sleep 5
 
-echo "[6/7] Flashing factory vendor.img + custom FART system.img (in fastbootd)..."
+echo "[6/8] Flashing factory vendor/product/system_ext + custom FART system.img..."
 fastboot flash vendor vendor.img
+fastboot flash product product.img
+fastboot flash system_ext system_ext.img
 fastboot flash system system-aosp-fart.img
 
-# Boot the freshly-flashed image. `fastboot reboot` from fastbootd enters Android
-# (not fastbootd again).
-echo "[7/7] Rebooting into Android..."
+# Wipe userdata: mandatory for a 15 -> 12 downgrade (incompatible encryption).
+echo "[7/8] Wiping userdata (mandatory for downgrade)..."
+fastboot -w
+
+# Boot the freshly-flashed image.
+echo "[8/8] Rebooting into Android..."
 fastboot reboot
 
 echo ""
 echo "=========================================="
 echo " Flash complete."
 echo ""
+echo " If it does not boot (anti-rollback refusal or bootloop):"
+echo "   recovery path = stock A15 factory image flash-all (see README)."
+echo ""
 echo " Post-flash steps:"
-echo "  1. Wait ~60s for first boot (FART-modified ART is JIT/AOT-compiling)"
-echo "  2. adb push f1rt.config /data/local/tmp/f1rt.config"
-echo "  3. adb shell setprop persist.sys.usb.config mtp,adb"
-echo "  4. adb shell am start -n com.sacombankpay/.MainVer2Activity"
-echo "  5. Wait 60 seconds for FART trigger"
-echo "  6. adb pull /data/data/com.sacombankpay/zskkk/"
+echo "  1. First boot takes ~2-5 min (FART-modified ART is AOT-compiling)"
+echo "  2. Enable USB debugging, then:"
+echo "     adb root"
+echo "     adb push f1rt.config /data/local/tmp/f1rt.config"
+echo "     adb shell chmod 644 /data/local/tmp/f1rt.config"
+echo "  3. Install/launch the target app:"
+echo "     adb shell monkey -p com.mustafahameed.mirmazacademy -c android.intent.category.LAUNCHER 1"
+echo "  4. Exercise the app; FART triggers on class loading (wait 60s+)"
+echo "  5. Pull the dumps:"
+echo "     adb pull /data/data/com.mustafahameed.mirmazacademy/zskkk/"
+echo "  6. Watch FART logs: adb logcat -s zskkk"
 echo "=========================================="
