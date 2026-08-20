@@ -181,6 +181,10 @@ jobs:
           git config --global http.lowSpeedLimit 1000
           git config --global http.lowSpeedTime 600
           repo sync -c -j4 --no-tags --no-clone-bundle --use-superproject --retry-fetches=3
+          # The build never uses `repo` again after this point. Drop repo's git
+          # object caches to reclaim tens of GB, otherwise systemimage compile
+          # runs out of disk on hosted runners.
+          rm -rf .repo/project-objects .repo/projects .repo/subprojects
           ls device/google/raviole/aosp_oriole.mk
           df -h /
 
