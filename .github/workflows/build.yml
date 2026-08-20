@@ -34,7 +34,7 @@ jobs:
           sudo apt-get clean
           df -h /
           FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "free after cleanup: ${FREE_GB}G (need >=80G for the all,-notdefault shallow sync)"
+          echo "free after cleanup: ${FREE_GB}G (need >=80G for AOSP sync + device trees)"
           if [ "${FREE_GB}" -lt 80 ]; then
             echo "ERROR: less than 80G free after cleanup; aborting before repo sync fills the disk" >&2
             exit 1
@@ -70,10 +70,10 @@ jobs:
         run: |
           mkdir -p aosp
           cd aosp
-          # -g all,-notdefault pulls in the device trees. For oriole the device
-          # tree is device/google/raviole (+ device/google/gs101, gs101-sepolicy,
-          # gs-common, raviole-kernel), all present at android-12.1.0_r2.
-          repo init -u https://android.googlesource.com/platform/manifest -b "${AOSP_TAG:-android-12.1.0_r2}" --depth=1 -g all,-notdefault
+          # Keep checkout narrow: default projects + explicit oriole device trees.
+          # all,-notdefault expands to almost the entire platform and leaves too
+          # little disk headroom for out/ during systemimage builds.
+          repo init -u https://android.googlesource.com/platform/manifest -b "${AOSP_TAG:-android-12.1.0_r2}" --depth=1
 
       - name: Repo sync
         run: |
@@ -88,7 +88,9 @@ jobs:
           # -j4 caps parallelism to avoid hammering mirrors. --no-tags + --depth=1
           # already minimize fetches. --use-superproject enables the partial
           # clone manifest from ANDROID 12+ that allows lazy checkout.
-          repo sync -c -j4 --no-tags --no-clone-bundle --use-superproject --retry-fetches=3
+          repo sync -c -j4 --no-tags --no-clone-bundle --use-superproject --retry-fetches=3 \
+            device/google/raviole device/google/gs101 device/google/gs101-sepolicy \
+            device/google/gs-common device/google/raviole-kernel
           echo "aosp synced: $(du -sh .repo | cut -f1) of manifest metadata"
           df -h /
           # Oriole sanity: device tree present at this tag?
@@ -173,14 +175,16 @@ jobs:
         run: |
           mkdir -p aosp
           cd aosp
-          repo init -u https://android.googlesource.com/platform/manifest -b "${AOSP_TAG:-android-12.1.0_r2}" --depth=1 -g all,-notdefault
+          repo init -u https://android.googlesource.com/platform/manifest -b "${AOSP_TAG:-android-12.1.0_r2}" --depth=1
           # Same googlesource hardening as the sync job (the build job sync was
           # previously unhardened and could hang on a throttled fetch).
           git config --global http.postBuffer 524288000
           git config --global core.compression 0
           git config --global http.lowSpeedLimit 1000
           git config --global http.lowSpeedTime 600
-          repo sync -c -j4 --no-tags --no-clone-bundle --use-superproject --retry-fetches=3
+          repo sync -c -j4 --no-tags --no-clone-bundle --use-superproject --retry-fetches=3 \
+            device/google/raviole device/google/gs101 device/google/gs101-sepolicy \
+            device/google/gs-common device/google/raviole-kernel
           ls device/google/raviole/aosp_oriole.mk
           df -h /
 
