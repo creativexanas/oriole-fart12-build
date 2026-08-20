@@ -184,6 +184,22 @@ jobs:
           ls device/google/raviole/aosp_oriole.mk
           df -h /
 
+      - name: Drop repo metadata before compile (avoid ENOSPC)
+        run: |
+          cd aosp
+          # This job does not call `repo` again after sync. Keeping `.repo`
+          # metadata (project object stores + manifests) wastes tens of GB and
+          # can crash the runner with ENOSPC while compiling systemimage.
+          du -sh .repo || true
+          rm -rf .repo
+          df -h /
+          FREE_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "free before build after dropping .repo: ${FREE_GB}G"
+          if [ "${FREE_GB}" -lt 35 ]; then
+            echo "ERROR: less than 35G free before compile; aborting before runner ENOSPC" >&2
+            exit 1
+          fi
+
       - name: Restore ccache + soong bootstrap
         uses: actions/cache@v4
         with:
